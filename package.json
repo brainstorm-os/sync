@@ -3,7 +3,7 @@
 	"version": "0.0.1",
 	"private": true,
 	"description": "Brainstorm zero-knowledge sync plane — a relay-blind, ciphertext-only sync node. Separate deploy boundary from the Electron client and the commercial control plane.",
-	"license": "UNLICENSED",
+	"license": "FSL-1.1-Apache-2.0",
 	"type": "module",
 	"scripts": {
 		"start": "bun run src/main.ts",

@@ -8,14 +8,14 @@ decrypt vault content: it reads only the plaintext routing header (which entity,
 who sent it) to fan a frame out to the other subscribers, and forwards the
 opaque ciphertext body untouched.
 
-This is a **separate deploy boundary** from the Electron client (`../brainstorm`)
-and the commercial control plane (`../brainstorm-cloud`). See [CLAUDE.md](./CLAUDE.md)
+This is a **separate deploy boundary** from the Electron client (`../app`)
+and the commercial control plane (`../cloud`). See [CLAUDE.md](./CLAUDE.md)
 for the invariants and the three-plane model.
 
 > A forward-only relay keeps nothing — lose your local data and there's no
 > restore. **SYNC-1** (this) is the live, online forwarding node; **SYNC-2** adds
 > the durable encrypted-snapshot store that makes backup/restore real (the
-> any-sync model). Roadmap in `../brainstorm/docs/implementation-plan.md`
+> any-sync model). Roadmap in `../docs/implementation-plan.md`
 > §"Durable sync node".
 
 ## Run
@@ -53,10 +53,10 @@ offline backfill + cold-restore work identically — the node still holds no key
 ## Admission & metering (SYNC-4b)
 
 Set `ENTITLEMENT_KEYS` (a `{kid: base64url-ed25519-pubkey}` JSON map of the
-`brainstorm-cloud` billing-edge signer keys) to make the node **gated**. A gated
+`cloud` billing-edge signer keys) to make the node **gated**. A gated
 connection must complete a two-proof handshake before it can emit/subscribe/query:
 
-1. a **`brainstorm-cloud` entitlement token** (verified offline against the
+1. a **`cloud` entitlement token** (verified offline against the
    keyset) → admission + plan + quota;
 2. a **server nonce signed by the device identity key** → proves the wire
    `account` (= `sender`), so the `catalog` query is scoped to it and emission is
