@@ -1,6 +1,6 @@
 # Brainstorm Sync
 
-A **zero-knowledge sync node** for [Brainstorm](https://github.com/brainst0rm-os/shell) — a relay-blind server that forwards and durably stores the **encrypted** CRDT traffic between a user's devices and collaborators.
+A **zero-knowledge sync node** for [Brainstorm](https://github.com/brainstorm-os/shell) — a relay-blind server that forwards and durably stores the **encrypted** CRDT traffic between a user's devices and collaborators.
 
 It holds **no key** and can never decrypt your content. It reads only the plaintext routing header (which entity, who sent it) to fan a message out to the other subscribers, and forwards the opaque ciphertext body untouched. Confidentiality is the client's job; this node only moves and stores sealed bytes.
 
