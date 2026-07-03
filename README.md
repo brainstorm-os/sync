@@ -20,6 +20,7 @@ Clients connect over WebSocket and speak a small binary wire protocol:
 
 - `0x00` + JSON control — `{op:"subscribe"|"unsubscribe", entityIds:[…]}`, `{op:"catalog", account}` (cold-restore enumeration), and, on a gated node, the `{op:"auth", token, account, sig}` handshake.
 - `0x01` + `<frame>` — an opaque encrypted update; the node fans it out to the entity's other subscribers.
+- `0x03` + `<bundle>` (server→client) — bundled backfill: many opaque frames length-prefixed into one message, sent only when a `subscribe` carries `bundle:true` (fresh-device bootstrap; old clients keep the per-frame stream).
 
 ## Storage
 
