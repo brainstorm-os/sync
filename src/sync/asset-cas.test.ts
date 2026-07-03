@@ -1,16 +1,18 @@
 /**
- * Asset-B3 — the durable node's content-addressed chunk store. Zero-dep
- * `bun test`. Covers the in-memory + filesystem backends (round-trip,
- * immutability, miss), hash validation / path-traversal defense, and
- * durability across a restart.
+ * Asset-B3/B6 — the durable node's content-addressed chunk store. Zero-dep
+ * `bun test`. Covers the in-memory + filesystem + object backends via one
+ * contract suite (round-trip, immutability, miss, GC delete), hash validation /
+ * path-traversal defense, and durability across a restart.
  */
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdtemp, readdir, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { MemoryAssetCas, isAssetHash } from "./asset-cas";
+import { type AssetCas, MemoryAssetCas, isAssetHash } from "./asset-cas";
 import { FileAssetCas } from "./file-asset-cas";
+import { ObjectAssetCas } from "./object-asset-cas";
+import { MemoryBucket } from "./object-store";
 
 const HASH_A = "a".repeat(64);
 const HASH_B = "b".repeat(64);
@@ -26,7 +28,7 @@ describe("isAssetHash", () => {
 	});
 });
 
-function casContract(make: () => MemoryAssetCas | FileAssetCas) {
+function casContract(make: () => AssetCas) {
 	test("put → has → get round-trips", async () => {
 		const cas = make();
 		const chunk = crypto.getRandomValues(new Uint8Array(1024));
@@ -51,6 +53,18 @@ function casContract(make: () => MemoryAssetCas | FileAssetCas) {
 		const cas = make();
 		await cas.put(HASH_A, new Uint8Array([1, 2, 3]));
 		expect(await cas.has(HASH_B)).toBe(false);
+	});
+
+	test("delete removes a chunk (Asset-B6 GC reclaim); deleting an absent one is a no-op", async () => {
+		const cas = make();
+		await cas.put(HASH_A, new Uint8Array([1, 2, 3]));
+		await cas.put(HASH_B, new Uint8Array([4]));
+		await cas.delete(HASH_A);
+		expect(await cas.has(HASH_A)).toBe(false);
+		expect(await cas.get(HASH_A)).toBeNull();
+		expect(await cas.has(HASH_B)).toBe(true); // siblings untouched
+		await cas.delete(HASH_A); // absent — no throw
+		await cas.delete("../../escape"); // hostile — no-op, no traversal
 	});
 }
 
@@ -107,5 +121,20 @@ describe("FileAssetCas", () => {
 		await Promise.all([cas.put(HASH_A, chunk), cas.put(HASH_A, chunk), cas.put(HASH_A, chunk)]);
 		const got = await cas.get(HASH_A);
 		expect(Buffer.from(got as Uint8Array).equals(Buffer.from(chunk))).toBe(true);
+	});
+});
+
+describe("ObjectAssetCas", () => {
+	casContract(() => new ObjectAssetCas(new MemoryBucket(), "node1/"));
+
+	test("delete removes exactly the chunk's object", async () => {
+		const bucket = new MemoryBucket();
+		const cas = new ObjectAssetCas(bucket, "node1/");
+		await cas.put(HASH_A, new Uint8Array([1]));
+		await cas.put(HASH_B, new Uint8Array([2]));
+		expect(bucket.size()).toBe(2);
+		await cas.delete(HASH_A);
+		expect(bucket.size()).toBe(1);
+		expect(await bucket.get(`node1/assets/${HASH_B}.bin`)).not.toBeNull();
 	});
 });

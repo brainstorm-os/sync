@@ -149,6 +149,7 @@ function gatedConfig(port: number, dir: string): Config {
 		entitlement: { keys: { k1: pubB64 }, requiredFeature: null, authTimeoutMs: 10_000 },
 		meteringLogPath: null,
 		limits: null,
+		assetGc: { graceMs: 1000, retentionMs: 10_000, sweepIntervalMs: null },
 		debug: false,
 	};
 }

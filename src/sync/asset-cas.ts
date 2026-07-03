@@ -28,6 +28,9 @@ export interface AssetCas {
 	put(hash: string, chunk: Uint8Array): Promise<void>;
 	/** Fetch a sealed chunk by ciphertext-hash, or null if absent. */
 	get(hash: string): Promise<Uint8Array | null>;
+	/** Remove a chunk (Asset-B6 GC reclaim). A no-op when absent. Only the
+	 *  grace-and-retention-gated sweep may call this — never a client verb. */
+	delete(hash: string): Promise<void>;
 }
 
 /** A ciphertext-hash address is a 64-char lowercase-hex sha256. Validated at
@@ -54,6 +57,10 @@ export class MemoryAssetCas implements AssetCas {
 	async get(hash: string): Promise<Uint8Array | null> {
 		const stored = this.#chunks.get(hash);
 		return stored ? new Uint8Array(stored) : null;
+	}
+
+	async delete(hash: string): Promise<void> {
+		this.#chunks.delete(hash);
 	}
 
 	/** Test/diagnostic: distinct chunks held. */
