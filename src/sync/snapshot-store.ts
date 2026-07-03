@@ -42,6 +42,30 @@ export type BackfillData = {
  *  the owner re-emitting a live wrap. */
 export const WRAP_RETENTION = 64;
 
+/**
+ * 10.11 routing-token rotation — outcome of a client-driven storage re-home
+ * (`migrate(from, to)`). The protocol is idempotent by construction: a client
+ * that crashed mid-rotation re-sends the same `rotate {from, to}` and the store
+ * converges — the entity's ciphertext is recoverable under at least one of the
+ * two routing ids at every instant, and under exactly `to` once the migration
+ * completes.
+ */
+export enum MigrateOutcome {
+	/** Data moved `from → to`. */
+	Moved = "moved",
+	/** Nothing under `from`, data under `to` — a completed migration re-sent
+	 *  (idempotent retry) — or a resumed journal with the source already gone. */
+	AlreadyDone = "already-done",
+	/** Neither id has data — nothing durable to move (forward-only rotation).
+	 *  Still a success: the caller installs the routing alias regardless. */
+	Nothing = "nothing",
+	/** `to` is already occupied by a DIFFERENT migration/entity (or `from` has a
+	 *  journal pointing elsewhere). Refused — a rotate must never overwrite
+	 *  ciphertext it did not migrate itself. The caller denies the rotation and
+	 *  the old routing id stays fully live (fail-closed). */
+	Conflict = "conflict",
+}
+
 export interface SnapshotStore {
 	/** Append one update frame to the entity's tail (since the last snapshot). */
 	appendTail(entityId: string, frame: Uint8Array): Promise<void>;
@@ -58,6 +82,11 @@ export interface SnapshotStore {
 	readBackfill(entityId: string): Promise<BackfillData>;
 	/** Latest snapshot version, or null if the entity has none. */
 	latestVersion(entityId: string): Promise<number | null>;
+	/** 10.11 routing-token rotation — re-home everything stored under `fromId`
+	 *  (snapshot + meta + tail + wraps) to `toId`. Idempotent; never leaves a
+	 *  state where the data is unreachable under BOTH ids (see `MigrateOutcome`).
+	 *  The ids are opaque routing tokens to the node — no crypto, no content. */
+	migrate(fromId: string, toId: string): Promise<MigrateOutcome>;
 }
 
 /**
@@ -135,5 +164,32 @@ export class MemorySnapshotStore implements SnapshotStore {
 
 	async latestVersion(entityId: string): Promise<number | null> {
 		return this.#snapshots.get(entityId)?.version ?? null;
+	}
+
+	async migrate(fromId: string, toId: string): Promise<MigrateOutcome> {
+		if (fromId === toId) return MigrateOutcome.Conflict;
+		const fromExists = this.#has(fromId);
+		const toExists = this.#has(toId);
+		if (!fromExists && !toExists) return MigrateOutcome.Nothing;
+		if (!fromExists) return MigrateOutcome.AlreadyDone;
+		if (toExists) return MigrateOutcome.Conflict;
+		const snap = this.#snapshots.get(fromId);
+		if (snap) this.#snapshots.set(toId, snap);
+		const tail = this.#tails.get(fromId);
+		if (tail) this.#tails.set(toId, tail);
+		const wraps = this.#wraps.get(fromId);
+		if (wraps) this.#wraps.set(toId, wraps);
+		this.#snapshots.delete(fromId);
+		this.#tails.delete(fromId);
+		this.#wraps.delete(fromId);
+		return MigrateOutcome.Moved;
+	}
+
+	#has(entityId: string): boolean {
+		return (
+			this.#snapshots.has(entityId) ||
+			(this.#tails.get(entityId)?.length ?? 0) > 0 ||
+			(this.#wraps.get(entityId)?.length ?? 0) > 0
+		);
 	}
 }

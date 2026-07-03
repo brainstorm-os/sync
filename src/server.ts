@@ -28,7 +28,7 @@ import { type MeterEvent, MeterKind, type MeterSink } from "./metering";
 import { FrameRouter } from "./router";
 import type { AccountCatalog } from "./sync/account-catalog";
 import type { AssetCas } from "./sync/asset-cas";
-import { type SnapshotStore, persistFrame } from "./sync/snapshot-store";
+import { MigrateOutcome, type SnapshotStore, persistFrame } from "./sync/snapshot-store";
 
 const CONTROL_CHANNEL_BYTE = 0x00;
 const FRAME_CHANNEL_BYTE = 0x01;
@@ -36,6 +36,25 @@ const FRAME_CHANNEL_BYTE = 0x01;
  *  from the Y.Doc relay's entity-routed fan-out. */
 const ASSET_CHANNEL_BYTE = 0x02;
 const DEFAULT_AUTH_TIMEOUT_MS = 10_000;
+/** 10.11 — how long a rotated-away routing token keeps working (alias `from →
+ *  to` on the router) so in-flight peers don't drop frames while they flip.
+ *  After expiry the old token is an unknown key. An evicted member observing
+ *  the OLD token sees traffic *timing* only until expiry (content went dark at
+ *  the DEK rotation itself); operators can shorten via `rotateGraceMs`. */
+export const DEFAULT_ROTATE_GRACE_MS = 10 * 60_000;
+
+/** 10.11 — why a `rotate` was refused. Sent in `rotate-denied.reason`. */
+export const RotateDenyReason = {
+	/** `to` is occupied by a different migration/entity (or a journal points
+	 *  elsewhere) — refusing to overwrite ciphertext the rotate didn't move. */
+	Conflict: "conflict",
+	/** Gated node: the proven account has no catalog record for `from`. */
+	NotAuthorized: "not-authorized",
+	/** The storage backend failed mid-migrate; nothing was aliased — the old
+	 *  token stays fully live and the client retries (fail-closed). */
+	StoreError: "store-error",
+} as const;
+export type RotateDenyReason = (typeof RotateDenyReason)[keyof typeof RotateDenyReason];
 
 /** WS close codes for gated rejections (4xxx = application range). */
 const CLOSE = {
@@ -71,6 +90,8 @@ export type RelayServerOptions = {
 	meter?: MeterSink;
 	/** SYNC-5 — abuse caps, rate limits, quotas. Absent ⇒ unbounded (tests). */
 	limits?: Limits;
+	/** 10.11 — dual-token grace window for routing-token rotation (ms). */
+	rotateGraceMs?: number;
 	/** Gated auth deadline; a connection that doesn't authenticate is closed. */
 	authTimeoutMs?: number;
 	/** Injectable timer for the auth deadline (default native setTimeout). */
@@ -82,10 +103,17 @@ export type SubscribeControl = { op: "subscribe"; entityIds: string[] };
 export type UnsubscribeControl = { op: "unsubscribe"; entityIds: string[] };
 /** SYNC-4a — "list the entities this account has" (cold-restore enumeration). */
 export type CatalogControl = { op: "catalog"; account: string };
+/** 10.11 — client-driven routing-token rotation: re-home durable storage
+ *  `from → to` and alias the old token for the grace window. `from`/`to` are
+ *  opaque routing tokens (the node never learns what entity they pseudonymize).
+ *  `account` feeds the catalog in open mode; a gated node ignores it and uses
+ *  the proven account. */
+export type RotateControl = { op: "rotate"; from: string; to: string; account?: string };
 export type RelayControlMessage =
 	| SubscribeControl
 	| UnsubscribeControl
 	| CatalogControl
+	| RotateControl
 	| AuthMessage;
 
 /** The node's reply to a `catalog` query — sent back on the control channel. */
@@ -98,11 +126,24 @@ export type CatalogResultMessage = {
 export type ChallengeMessage = { op: "challenge"; nonce: string };
 export type AuthOkMessage = { op: "auth-ok"; plan: string };
 export type AuthErrorMessage = { op: "auth-error"; reason: string };
+/** 10.11 — rotation acknowledged: storage re-homed (or nothing durable to
+ *  move), alias installed. Only AFTER this ack may the client flip emission
+ *  to the new token (fail-closed: no ack ⇒ keep the old token). */
+export type RotatedMessage = { op: "rotated"; from: string; to: string };
+/** 10.11 — rotation refused; the old token stays fully live. */
+export type RotateDeniedMessage = {
+	op: "rotate-denied";
+	from: string;
+	to: string;
+	reason: RotateDenyReason;
+};
 export type ControlReply =
 	| CatalogResultMessage
 	| ChallengeMessage
 	| AuthOkMessage
-	| AuthErrorMessage;
+	| AuthErrorMessage
+	| RotatedMessage
+	| RotateDeniedMessage;
 
 /** Minimal Bun-ws-shaped interface so the core is testable without a socket. */
 export interface ServerWebSocketLike {
@@ -144,12 +185,13 @@ export function createRelayCore(opts: RelayServerOptions = {}): RelayCore {
 		...(opts.auditSink ? { sink: opts.auditSink } : {}),
 		...(opts.now ? { now: opts.now } : {}),
 	});
-	const router = new FrameRouter(audit);
+	const now = opts.now ?? Date.now;
+	const router = new FrameRouter(audit, { now });
 	const connections = new Map<string, ServerWebSocketLike>();
 	const connState = new Map<string, ConnState>();
 	const mintConnId = opts.mintConnId ?? defaultMintConnId();
-	const now = opts.now ?? Date.now;
 	const { store, catalog, admission, meter, limits, assetCas, assetGc } = opts;
+	const rotateGraceMs = opts.rotateGraceMs ?? DEFAULT_ROTATE_GRACE_MS;
 	const authTimeoutMs = opts.authTimeoutMs ?? DEFAULT_AUTH_TIMEOUT_MS;
 	const setTimer = opts.setTimer ?? ((cb, ms) => setTimeout(cb, ms));
 	const clearTimer = opts.clearTimer ?? ((h) => clearTimeout(h as ReturnType<typeof setTimeout>));
@@ -364,6 +406,10 @@ export function createRelayCore(opts: RelayServerOptions = {}): RelayCore {
 			return true;
 		});
 		if (!result.header || result.dropped !== 0) return;
+		// 10.11 — persist/catalog/meter under the CANONICAL routing key so a
+		// frame emitted under a rotated-away token during grace lands in the
+		// NEW token's storage (no ciphertext orphaned under the old token).
+		const routingKey = result.routingKey ?? result.header.entityId;
 
 		emit({
 			kind: MeterKind.Ingress,
@@ -371,17 +417,15 @@ export function createRelayCore(opts: RelayServerOptions = {}): RelayCore {
 			sub: state.sub,
 			plan: state.plan,
 			bytes: frame.length,
-			entityId: result.header.entityId,
+			entityId: routingKey,
 		});
 
 		if (store) {
 			const persisted = new Uint8Array(frame);
-			void persistFrame(store, result.header.entityId, result.header.kind, persisted).catch(
-				reportStoreError,
-			);
+			void persistFrame(store, routingKey, result.header.kind, persisted).catch(reportStoreError);
 		}
 		if (catalog) {
-			void catalog.record(result.header.sender, result.header.entityId).catch(reportStoreError);
+			void catalog.record(result.header.sender, routingKey).catch(reportStoreError);
 		}
 	}
 
@@ -426,8 +470,11 @@ export function createRelayCore(opts: RelayServerOptions = {}): RelayCore {
 		if (message.op === "subscribe") {
 			for (const entityId of message.entityIds) {
 				if (limits && !limits.subAllowed(router.connectionEntities(connId).length)) break;
-				router.subscribe(connId, entityId);
-				if (store) backfill(store, entityId, connId, send, emit, state, reportStoreError);
+				// 10.11 — a subscribe under a rotated-away token lands on the new
+				// token's channel during grace; backfill reads the re-homed storage.
+				const key = router.resolveKey(entityId);
+				router.subscribe(connId, key);
+				if (store) backfill(store, key, connId, send, emit, state, reportStoreError);
 			}
 			return;
 		}
@@ -435,10 +482,68 @@ export function createRelayCore(opts: RelayServerOptions = {}): RelayCore {
 			for (const entityId of message.entityIds) router.unsubscribe(connId, entityId);
 			return;
 		}
+		if (message.op === "rotate") {
+			handleRotate(connId, state, message);
+			return;
+		}
 		// catalog — gated: force the proven account (closes the metadata leak).
 		if (!catalog) return;
 		const account = admission ? (state.account ?? message.account) : message.account;
 		answerCatalog(catalog, store, account, connId, sendControl, reportStoreError);
+	}
+
+	/**
+	 * 10.11 — client-driven routing-token rotation (OQ-197). Order is the
+	 * fail-closed contract:
+	 *   1. authorize (gated: the proven account must have a catalog record for
+	 *      `from` — only the entity's own emitter can re-home it);
+	 *   2. `store.migrate(from, to)` — idempotent re-home; `Conflict` or a store
+	 *      throw denies WITHOUT touching the router, so the old token stays
+	 *      fully live and the client retries;
+	 *   3. only then alias + move subscribers (`router.applyRotation`) and
+	 *      record `to` in the catalog;
+	 *   4. `rotated` ack LAST — the client flips emission only on this ack.
+	 * A node that predates this verb parses it to null and stays silent: the
+	 * client never gets an ack and never flips (backward compatible).
+	 */
+	function handleRotate(connId: string, state: ConnState, message: RotateControl): void {
+		const { from, to } = message;
+		const deny = (reason: RotateDenyReason): void =>
+			sendControl(connId, { op: "rotate-denied", from, to, reason });
+		void (async () => {
+			const account = admission ? state.account : (message.account ?? null);
+			if (admission) {
+				// Gated: only the account that emitted for `from` may rotate it. The
+				// catalog keeps `from` after migration, so a crash-retry stays
+				// authorized. No catalog ⇒ no ownership data ⇒ fail closed.
+				if (!catalog || !account) {
+					deny(RotateDenyReason.NotAuthorized);
+					return;
+				}
+				const owned = await catalog.list(account);
+				if (!owned.includes(from)) {
+					deny(RotateDenyReason.NotAuthorized);
+					return;
+				}
+			}
+			if (store) {
+				let outcome: MigrateOutcome;
+				try {
+					outcome = await store.migrate(from, to);
+				} catch (error) {
+					reportStoreError(error);
+					deny(RotateDenyReason.StoreError);
+					return;
+				}
+				if (outcome === MigrateOutcome.Conflict) {
+					deny(RotateDenyReason.Conflict);
+					return;
+				}
+			}
+			router.applyRotation(from, to, now() + rotateGraceMs);
+			if (catalog && account) await catalog.record(account, to).catch(reportStoreError);
+			sendControl(connId, { op: "rotated", from, to });
+		})().catch(reportStoreError);
 	}
 
 	return { router, audit, handlers, connections, connState };
@@ -520,6 +625,13 @@ function parseControl(body: Uint8Array): RelayControlMessage | null {
 			return typeof v.account === "string" && v.account.length > 0
 				? { op: "catalog", account: v.account }
 				: null;
+		}
+		if (v.op === "rotate") {
+			if (typeof v.from !== "string" || v.from.length === 0) return null;
+			if (typeof v.to !== "string" || v.to.length === 0) return null;
+			if (v.from === v.to) return null;
+			const account = typeof v.account === "string" && v.account.length > 0 ? v.account : undefined;
+			return { op: "rotate", from: v.from, to: v.to, ...(account ? { account } : {}) };
 		}
 		if (v.op !== "subscribe" && v.op !== "unsubscribe") return null;
 		if (!Array.isArray(v.entityIds)) return null;
