@@ -26,9 +26,14 @@
  */
 
 import { Buffer } from "node:buffer";
-import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
-import { type BackfillData, type SnapshotStore, WRAP_RETENTION } from "./snapshot-store";
+import {
+	type BackfillData,
+	MigrateOutcome,
+	type SnapshotStore,
+	WRAP_RETENTION,
+} from "./snapshot-store";
 
 type Paths = { dir: string; snapshot: string; meta: string; tail: string; wraps: string };
 
@@ -106,6 +111,29 @@ export class FileSnapshotStore implements SnapshotStore {
 		});
 	}
 
+	/**
+	 * 10.11 rotation re-home — the whole per-entity directory moves in ONE
+	 * atomic `rename` (same filesystem: `from` and `to` are both under the
+	 * store root). There is no torn state: a crash leaves the directory under
+	 * exactly one of the two ids, complete, and the client's idempotent
+	 * `rotate` retry converges (`from` gone + `to` present ⇒ `AlreadyDone`).
+	 */
+	migrate(fromId: string, toId: string): Promise<MigrateOutcome> {
+		if (fromId === toId) return Promise.resolve(MigrateOutcome.Conflict);
+		return this.#serial2(fromId, toId, async () => {
+			const fromDir = this.#pathsFor(fromId).dir;
+			const toDir = this.#pathsFor(toId).dir;
+			const fromExists = await dirExists(fromDir);
+			const toExists = await dirExists(toDir);
+			if (!fromExists && !toExists) return MigrateOutcome.Nothing;
+			if (!fromExists) return MigrateOutcome.AlreadyDone;
+			if (toExists) return MigrateOutcome.Conflict;
+			await mkdir(dirname(toDir), { recursive: true });
+			await rename(fromDir, toDir);
+			return MigrateOutcome.Moved;
+		});
+	}
+
 	#pathsFor(entityId: string): Paths {
 		const safe = Buffer.from(entityId, "utf8").toString("base64url");
 		const shard = safe.slice(0, 2) || "_";
@@ -132,6 +160,29 @@ export class FileSnapshotStore implements SnapshotStore {
 			),
 		);
 		return next;
+	}
+
+	/** Serialize `op` behind BOTH entities' write chains (migrate touches two). */
+	#serial2<T>(a: string, b: string, op: () => Promise<T>): Promise<T> {
+		const priorA = this.#queues.get(a) ?? Promise.resolve();
+		const priorB = this.#queues.get(b) ?? Promise.resolve();
+		const gate = Promise.allSettled([priorA, priorB]);
+		const next = gate.then(op);
+		const settled = next.then(
+			() => undefined,
+			() => undefined,
+		);
+		this.#queues.set(a, settled);
+		this.#queues.set(b, settled);
+		return next;
+	}
+}
+
+async function dirExists(path: string): Promise<boolean> {
+	try {
+		return (await stat(path)).isDirectory();
+	} catch {
+		return false;
 	}
 }
 

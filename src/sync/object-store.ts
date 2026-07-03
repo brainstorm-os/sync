@@ -36,7 +36,12 @@
  */
 
 import type { AccountCatalog } from "./account-catalog";
-import { type BackfillData, type SnapshotStore, WRAP_RETENTION } from "./snapshot-store";
+import {
+	type BackfillData,
+	MigrateOutcome,
+	type SnapshotStore,
+	WRAP_RETENTION,
+} from "./snapshot-store";
 
 /**
  * The storage seam SYNC-3 swaps. Keys are opaque strings; values opaque bytes.
@@ -144,6 +149,60 @@ export class ObjectSnapshotStore implements SnapshotStore {
 		return this.#serial(entityId, () => this.#readVersion(entityId));
 	}
 
+	/**
+	 * 10.11 rotation re-home. Object stores have no atomic directory rename, so
+	 * the migration is journaled: `<prefix>migrations/<safe(from)>.json = {to}`
+	 * is written BEFORE the copy, the copy runs `from → to` (overwrite-safe),
+	 * `from` objects are deleted only after every copy landed, and the journal
+	 * is deleted last. A crash at any point leaves `from` complete (pre-copy /
+	 * mid-copy) or `to` complete (post-copy), and the client's idempotent
+	 * `rotate` retry resumes from the journal. `to` occupied WITHOUT a matching
+	 * journal ⇒ `Conflict` — a rotate never overwrites ciphertext it did not
+	 * migrate itself.
+	 */
+	migrate(fromId: string, toId: string): Promise<MigrateOutcome> {
+		if (fromId === toId) return Promise.resolve(MigrateOutcome.Conflict);
+		return this.#serial2(fromId, toId, async () => {
+			const journalKey = `${this.#prefix}migrations/${safeName(fromId)}.json`;
+			const fromPrefix = `${this.#prefix}${safeName(fromId)}/`;
+			const toPrefix = `${this.#prefix}${safeName(toId)}/`;
+			const journalTo = await this.#readJournal(journalKey);
+			const fromKeys = await this.#bucket.list(fromPrefix);
+			const toKeys = await this.#bucket.list(toPrefix);
+			const resuming = journalTo === toId;
+			if (!resuming) {
+				if (journalTo !== null) return MigrateOutcome.Conflict;
+				if (fromKeys.length === 0 && toKeys.length === 0) return MigrateOutcome.Nothing;
+				if (fromKeys.length === 0) return MigrateOutcome.AlreadyDone;
+				if (toKeys.length > 0) return MigrateOutcome.Conflict;
+				await this.#bucket.put(journalKey, TEXT.enc.encode(JSON.stringify({ to: toId })));
+			}
+			for (const key of fromKeys) {
+				const bytes = await this.#bucket.get(key);
+				if (bytes) await this.#bucket.put(`${toPrefix}${key.slice(fromPrefix.length)}`, bytes);
+			}
+			// Source objects go only after every copy landed; journal goes last.
+			for (const key of fromKeys) await this.#bucket.delete(key);
+			await this.#bucket.delete(journalKey);
+			this.#nextTail.delete(fromId);
+			this.#nextTail.delete(toId);
+			this.#nextWrap.delete(fromId);
+			this.#nextWrap.delete(toId);
+			return fromKeys.length > 0 ? MigrateOutcome.Moved : MigrateOutcome.AlreadyDone;
+		});
+	}
+
+	async #readJournal(journalKey: string): Promise<string | null> {
+		const raw = await this.#bucket.get(journalKey);
+		if (!raw) return null;
+		try {
+			const parsed = JSON.parse(TEXT.dec.decode(raw)) as { to?: unknown };
+			return typeof parsed.to === "string" && parsed.to.length > 0 ? parsed.to : null;
+		} catch {
+			return null;
+		}
+	}
+
 	async #readVersion(entityId: string): Promise<number | null> {
 		const raw = await this.#bucket.get(this.#key(entityId, "meta.json"));
 		if (!raw) return null;
@@ -193,6 +252,20 @@ export class ObjectSnapshotStore implements SnapshotStore {
 				() => undefined,
 			),
 		);
+		return next;
+	}
+
+	/** Serialize `op` behind BOTH entities' write chains (migrate touches two). */
+	#serial2<T>(a: string, b: string, op: () => Promise<T>): Promise<T> {
+		const priorA = this.#queues.get(a) ?? Promise.resolve();
+		const priorB = this.#queues.get(b) ?? Promise.resolve();
+		const next = Promise.allSettled([priorA, priorB]).then(op);
+		const settled = next.then(
+			() => undefined,
+			() => undefined,
+		);
+		this.#queues.set(a, settled);
+		this.#queues.set(b, settled);
 		return next;
 	}
 }
