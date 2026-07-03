@@ -133,3 +133,57 @@ function invalid(message: string): Error {
 	err.name = "Invalid";
 	return err;
 }
+
+/**
+ * 10.10 — bundled-backfill payload framing (server→client, channel `0x03`).
+ *
+ * A bundle packs many wire frames into ONE WebSocket message so a fresh-device
+ * bootstrap (10.14 restore) doesn't pay a message per `wrap/snapshot/tail`
+ * frame. It is pure FRAMING: each sub-frame is byte-identical to the frame
+ * that would have ridden its own `0x01` message — still an opaque ciphertext
+ * envelope the node never decodes (relay-blind preserved).
+ *
+ * Layout: repeated `u32-be(subFrameLen) || subFrameBytes`, no count prefix —
+ * the lengths must consume the payload exactly.
+ */
+export function encodeBundlePayload(frames: readonly Uint8Array[]): Uint8Array {
+	if (frames.length === 0) throw invalid("bundle: refusing to encode an empty bundle");
+	let total = 0;
+	for (const frame of frames) {
+		if (frame.length === 0) throw invalid("bundle: refusing to encode an empty sub-frame");
+		total += 4 + frame.length;
+	}
+	const out = new Uint8Array(total);
+	const view = new DataView(out.buffer);
+	let offset = 0;
+	for (const frame of frames) {
+		view.setUint32(offset, frame.length, false);
+		offset += 4;
+		out.set(frame, offset);
+		offset += frame.length;
+	}
+	return out;
+}
+
+/**
+ * Strict decode of a bundle payload (the bytes after the `0x03` channel byte).
+ * Throws `Invalid` on any deviation — empty payload, truncated length prefix,
+ * zero-length sub-frame, or a length that overruns / underruns the payload.
+ * Each returned sub-frame is a copy (safe to retain past the message buffer).
+ */
+export function decodeBundlePayload(payload: Uint8Array): Uint8Array[] {
+	if (payload.length === 0) throw invalid("bundle: empty payload");
+	const view = new DataView(payload.buffer, payload.byteOffset, payload.byteLength);
+	const frames: Uint8Array[] = [];
+	let offset = 0;
+	while (offset < payload.length) {
+		if (offset + 4 > payload.length) throw invalid("bundle: truncated sub-frame length");
+		const len = view.getUint32(offset, false);
+		offset += 4;
+		if (len === 0) throw invalid("bundle: zero-length sub-frame");
+		if (offset + len > payload.length) throw invalid("bundle: sub-frame overruns payload");
+		frames.push(new Uint8Array(payload.subarray(offset, offset + len)));
+		offset += len;
+	}
+	return frames;
+}

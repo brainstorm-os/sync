@@ -29,12 +29,22 @@ import { FrameRouter } from "./router";
 import type { AccountCatalog } from "./sync/account-catalog";
 import type { AssetCas } from "./sync/asset-cas";
 import { MigrateOutcome, type SnapshotStore, persistFrame } from "./sync/snapshot-store";
+import { encodeBundlePayload } from "./wire";
 
 const CONTROL_CHANNEL_BYTE = 0x00;
 const FRAME_CHANNEL_BYTE = 0x01;
 /** Asset-B3 — the blob plane: content-addressed chunk PUT/GET/HAS, distinct
  *  from the Y.Doc relay's entity-routed fan-out. */
 const ASSET_CHANNEL_BYTE = 0x02;
+/** 10.10 — bundled backfill (server→client only): many opaque wire frames in
+ *  one WebSocket message (`encodeBundlePayload` framing). Sent only to a
+ *  client that asked via `subscribe.bundle` — an old client never sees it. */
+const BUNDLE_CHANNEL_BYTE = 0x03;
+/** Flush a backfill bundle before its payload would exceed this. Stays under
+ *  the 1 MiB frame cap a client-side inbound guard might mirror. */
+const BUNDLE_MAX_BYTES = 512 << 10;
+/** Hard cap on sub-frames per bundle (bounds decode work per message). */
+const BUNDLE_MAX_FRAMES = 256;
 const DEFAULT_AUTH_TIMEOUT_MS = 10_000;
 /** 10.11 — how long a rotated-away routing token keeps working (alias `from →
  *  to` on the router) so in-flight peers don't drop frames while they flip.
@@ -99,7 +109,10 @@ export type RelayServerOptions = {
 	clearTimer?: (handle: unknown) => void;
 };
 
-export type SubscribeControl = { op: "subscribe"; entityIds: string[] };
+/** `bundle` (10.10, optional) — the client understands the `0x03` bundle
+ *  channel: serve its backfill as bundled frames instead of one message per
+ *  frame. Absent/false ⇒ the per-frame path (old clients, and the fallback). */
+export type SubscribeControl = { op: "subscribe"; entityIds: string[]; bundle?: boolean };
 export type UnsubscribeControl = { op: "unsubscribe"; entityIds: string[] };
 /** SYNC-4a — "list the entities this account has" (cold-restore enumeration). */
 export type CatalogControl = { op: "catalog"; account: string };
@@ -232,6 +245,19 @@ export function createRelayCore(opts: RelayServerOptions = {}): RelayCore {
 		const wire = new Uint8Array(1 + body.length);
 		wire[0] = CONTROL_CHANNEL_BYTE;
 		wire.set(body, 1);
+		try {
+			ws.send(wire);
+		} catch {
+			// closed socket — drop quietly.
+		}
+	}
+
+	function sendBundle(toConnId: string, payload: Uint8Array): void {
+		const ws = connections.get(toConnId);
+		if (!ws) return;
+		const wire = new Uint8Array(1 + payload.length);
+		wire[0] = BUNDLE_CHANNEL_BYTE;
+		wire.set(payload, 1);
 		try {
 			ws.send(wire);
 		} catch {
@@ -468,13 +494,23 @@ export function createRelayCore(opts: RelayServerOptions = {}): RelayCore {
 
 		if (message.op === "auth") return; // already authenticated / open mode
 		if (message.op === "subscribe") {
+			const accepted: string[] = [];
 			for (const entityId of message.entityIds) {
 				if (limits && !limits.subAllowed(router.connectionEntities(connId).length)) break;
 				// 10.11 — a subscribe under a rotated-away token lands on the new
 				// token's channel during grace; backfill reads the re-homed storage.
 				const key = router.resolveKey(entityId);
 				router.subscribe(connId, key);
-				if (store) backfill(store, key, connId, send, emit, state, reportStoreError);
+				accepted.push(key);
+			}
+			if (store && accepted.length > 0) {
+				if (message.bundle === true) {
+					backfillBundled(store, accepted, connId, sendBundle, emit, state, reportStoreError);
+				} else {
+					for (const key of accepted) {
+						backfill(store, key, connId, send, emit, state, reportStoreError);
+					}
+				}
 			}
 			return;
 		}
@@ -585,6 +621,64 @@ function backfill(
 	}, reportError);
 }
 
+/**
+ * 10.10 — replay durable `wraps ++ snapshot ++ tail` for MANY entities to one
+ * connection as bundled frames (`0x03` channel): sub-frames byte-identical to
+ * the per-entity stream, packed into as few WebSocket messages as the
+ * `BUNDLE_MAX_BYTES` / `BUNDLE_MAX_FRAMES` caps allow. Per-entity frame order
+ * (wraps first, then snapshot, then tail) and the entity order of the
+ * subscribe list are preserved. Egress is metered per entity, exactly like the
+ * per-frame path. Fire-and-forget.
+ */
+function backfillBundled(
+	store: SnapshotStore,
+	entityIds: string[],
+	connId: string,
+	sendBundle: (toConnId: string, payload: Uint8Array) => void,
+	emit: (event: Omit<MeterEvent, "ts">) => void,
+	state: ConnState,
+	reportError: (error: unknown) => void,
+): void {
+	void (async () => {
+		let batch: Uint8Array[] = [];
+		let batchBytes = 0;
+		const flush = (): void => {
+			if (batch.length === 0) return;
+			sendBundle(connId, encodeBundlePayload(batch));
+			batch = [];
+			batchBytes = 0;
+		};
+		for (const entityId of entityIds) {
+			const { frames } = await store.readBackfill(entityId);
+			let bytes = 0;
+			for (const frame of frames) {
+				if (frame.length === 0) continue;
+				const framed = 4 + frame.length;
+				if (
+					batch.length >= BUNDLE_MAX_FRAMES ||
+					(batch.length > 0 && batchBytes + framed > BUNDLE_MAX_BYTES)
+				) {
+					flush();
+				}
+				batch.push(frame);
+				batchBytes += framed;
+				bytes += frame.length;
+			}
+			if (bytes > 0) {
+				emit({
+					kind: MeterKind.Egress,
+					account: state.account,
+					sub: state.sub,
+					plan: state.plan,
+					bytes,
+					entityId,
+				});
+			}
+		}
+		flush();
+	})().catch(reportError);
+}
+
 /** SYNC-4a — answer a `catalog` query on the control channel. Fire-and-forget. */
 function answerCatalog(
 	catalog: AccountCatalog,
@@ -636,6 +730,7 @@ function parseControl(body: Uint8Array): RelayControlMessage | null {
 		if (v.op !== "subscribe" && v.op !== "unsubscribe") return null;
 		if (!Array.isArray(v.entityIds)) return null;
 		const entityIds = v.entityIds.filter((e): e is string => typeof e === "string" && e.length > 0);
+		if (v.op === "subscribe" && v.bundle === true) return { op: v.op, entityIds, bundle: true };
 		return { op: v.op, entityIds };
 	} catch {
 		return null;
@@ -658,4 +753,11 @@ function defaultMintConnId(): () => string {
 	};
 }
 
-export const WIRE_CHANNELS = { CONTROL_CHANNEL_BYTE, FRAME_CHANNEL_BYTE } as const;
+export const WIRE_CHANNELS = {
+	CONTROL_CHANNEL_BYTE,
+	FRAME_CHANNEL_BYTE,
+	BUNDLE_CHANNEL_BYTE,
+} as const;
+
+/** 10.10 — bundle build caps, exported for tests. */
+export const BUNDLE_LIMITS = { BUNDLE_MAX_BYTES, BUNDLE_MAX_FRAMES } as const;
