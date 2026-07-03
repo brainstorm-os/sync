@@ -7,6 +7,7 @@
 
 import { beforeAll, describe, expect, test } from "bun:test";
 import { Admission } from "./admission";
+import { AssetWireKind, encodeAssetRequest } from "./asset-wire";
 import {
 	ENTITLEMENT_TOKEN_VERSION,
 	type EntitlementClaims,
@@ -18,11 +19,15 @@ import { DEFAULT_LIMITS, Limits, type LimitsConfig } from "./limits";
 import { type MeterEvent, MeterKind } from "./metering";
 import { type RelayCore, type ServerWebSocketLike, createRelayCore } from "./server";
 import { MemoryAccountCatalog } from "./sync/account-catalog";
+import { MemoryAssetCas } from "./sync/asset-cas";
+import { AssetGc } from "./sync/asset-gc";
+import { MemoryRefLedger } from "./sync/ref-ledger";
 import { MemorySnapshotStore } from "./sync/snapshot-store";
 import { PROTOCOL_VERSION, WireKind } from "./wire";
 
 const FRAME = 0x01;
 const CONTROL = 0x00;
+const ASSET = 0x02;
 const enc = new TextEncoder();
 const dec = new TextDecoder();
 const b64 = (b: Uint8Array | string) =>
@@ -38,7 +43,12 @@ const genKeypair = async (): Promise<CryptoKeyPair> =>
 		"sign",
 		"verify",
 	])) as unknown as CryptoKeyPair;
-const tick = () => new Promise((r) => setTimeout(r, 5));
+/** The admission verify is real async WebCrypto — a fixed short sleep flakes
+ *  on a loaded box. Poll (bounded) until the async work observably landed. */
+const until = async (done: () => boolean): Promise<void> => {
+	const deadline = Date.now() + 5_000;
+	while (!done() && Date.now() < deadline) await new Promise((r) => setTimeout(r, 5));
+};
 
 let billingPriv: CryptoKey;
 let keys: VerifierKeySet;
@@ -148,7 +158,10 @@ async function authenticate(
 		ws,
 		channel(CONTROL, enc.encode(JSON.stringify({ op: "auth", token, account: acct, sig }))),
 	);
-	await tick();
+	await until(
+		() =>
+			controls(ws).some((c) => c.op === "auth-ok" || c.op === "auth-error") || ws.closed !== null,
+	);
 	return connId;
 }
 
@@ -203,7 +216,7 @@ describe("gated relay core (SYNC-4b)", () => {
 				enc.encode(JSON.stringify({ op: "auth", token: await signToken(), account, sig })),
 			),
 		);
-		await tick();
+		await until(() => controls(sender).some((c) => c.op === "auth-ok"));
 		core.handlers.onMessage(sender, channel(FRAME, frame("e1", account)));
 		expect(frames(receiver).length).toBe(1);
 	});
@@ -236,7 +249,7 @@ describe("gated relay core (SYNC-4b)", () => {
 			ws,
 			channel(CONTROL, enc.encode(JSON.stringify({ op: "catalog", account: "victim" }))),
 		);
-		await tick();
+		await until(() => controls(ws).some((c) => c.op === "catalog-result"));
 		const result = controls(ws).find((c) => c.op === "catalog-result");
 		expect(result.account).toBe(account);
 		expect(result.entities.map((e: { entityId: string }) => e.entityId)).toEqual(["mine"]);
@@ -290,9 +303,56 @@ describe("gated relay core (SYNC-4b)", () => {
 				enc.encode(JSON.stringify({ op: "auth", token: "not.a.token", account, sig })),
 			),
 		);
-		await tick();
+		await until(() => ws.closed !== null);
 		expect(controls(ws).some((c) => c.op === "auth-error")).toBe(true);
 		expect(ws.closed?.code).toBe(4401);
+	});
+
+	test("an unauthenticated ref-report is dropped (Asset-B6)", async () => {
+		const cas = new MemoryAssetCas();
+		const ledger = new MemoryRefLedger();
+		const core = gatedCore({ assetCas: cas, assetGc: new AssetGc({ cas, ledger }) });
+		const ws = makeWs();
+		core.handlers.onOpen(ws); // challenged, NOT authenticated
+		core.handlers.onMessage(
+			ws,
+			channel(
+				ASSET,
+				encodeAssetRequest({
+					kind: AssetWireKind.Refs,
+					account,
+					device: "laptop",
+					hashes: ["a".repeat(64)],
+				}),
+			),
+		);
+		await new Promise((r) => setTimeout(r, 20));
+		expect(ws.sent.filter((b) => b[0] === ASSET)).toEqual([]);
+		expect(await ledger.accounts()).toEqual([]);
+	});
+
+	test("a ref-report is scoped to the PROVEN account, ignoring a forged header (Asset-B6)", async () => {
+		const cas = new MemoryAssetCas();
+		const ledger = new MemoryRefLedger();
+		const core = gatedCore({ assetCas: cas, assetGc: new AssetGc({ cas, ledger }) });
+		const ws = makeWs();
+		await authenticate(core, ws, await signToken());
+		core.handlers.onMessage(
+			ws,
+			channel(
+				ASSET,
+				encodeAssetRequest({
+					kind: AssetWireKind.Refs,
+					account: "victim",
+					device: "laptop",
+					hashes: ["a".repeat(64)],
+				}),
+			),
+		);
+		await until(() => ws.sent.some((b) => b[0] === ASSET));
+		expect(await ledger.accounts()).toEqual([account]); // never "victim"
+		const state = await ledger.read(account);
+		expect(state.devices.laptop?.refs).toEqual(["a".repeat(64)]);
 	});
 });
 
