@@ -21,7 +21,7 @@
 import type { Admission, AdmissionResult, AuthMessage } from "./admission";
 // relay-blind-exempt-free: the asset wire is a crypto-free content-address
 // router (opaque ciphertext keyed by an opaque hash; no key, no decrypt).
-import { AssetWireKind, handleAssetRequest } from "./asset-wire";
+import { type AssetGcHooks, AssetWireKind, handleAssetRequest } from "./asset-wire";
 import { AuditLog, type AuditSink } from "./audit-log";
 import type { Limits } from "./limits";
 import { type MeterEvent, MeterKind, type MeterSink } from "./metering";
@@ -78,6 +78,10 @@ export type RelayServerOptions = {
 	 *  node has no asset plane (asset frames are dropped); the Y.Doc plane is
 	 *  unaffected. */
 	assetCas?: AssetCas;
+	/** Asset-B6 — the GC hooks (ownership attribution on Put + the Refs report
+	 *  sink). Absent ⇒ no GC plane: Refs requests are dropped, Put/Get/Has are
+	 *  unaffected. */
+	assetGc?: AssetGcHooks;
 	/** SYNC-4b — when present, the node is GATED: a connection must complete the
 	 *  token + identity handshake before it can emit / subscribe / query. Absent
 	 *  ⇒ open admission (dev / forward node), wire path unchanged. */
@@ -186,7 +190,7 @@ export function createRelayCore(opts: RelayServerOptions = {}): RelayCore {
 	const connections = new Map<string, ServerWebSocketLike>();
 	const connState = new Map<string, ConnState>();
 	const mintConnId = opts.mintConnId ?? defaultMintConnId();
-	const { store, catalog, admission, meter, limits, assetCas } = opts;
+	const { store, catalog, admission, meter, limits, assetCas, assetGc } = opts;
 	const rotateGraceMs = opts.rotateGraceMs ?? DEFAULT_ROTATE_GRACE_MS;
 	const authTimeoutMs = opts.authTimeoutMs ?? DEFAULT_AUTH_TIMEOUT_MS;
 	const setTimer = opts.setTimer ?? ((cb, ms) => setTimeout(cb, ms));
@@ -249,17 +253,22 @@ export function createRelayCore(opts: RelayServerOptions = {}): RelayCore {
 	}
 
 	/**
-	 * Asset-B3 — serve one blob-plane request (HAS / PUT / GET) against the CAS
-	 * and reply point-to-point on the asset channel (no fan-out — it's
-	 * request/response, not pub/sub). Gated by the same admission as frames; a
-	 * PUT is metered as ingress, a served GET as egress. A malformed request is
-	 * dropped (never crashes the connection).
+	 * Asset-B3/B6 — serve one blob-plane request (HAS / PUT / GET / REFS)
+	 * against the CAS + GC hooks and reply point-to-point on the asset channel
+	 * (no fan-out — it's request/response, not pub/sub). Gated by the same
+	 * admission as frames, and the GC context carries the PROVEN account so a
+	 * gated ref report / Put attribution can't be forged. A PUT is metered as
+	 * ingress, a served GET as egress. A malformed request is dropped (never
+	 * crashes the connection).
 	 */
 	function handleAsset(connId: string, state: ConnState, body: Uint8Array): void {
 		if (limits?.frameTooLarge(body.length)) return;
 		if (admission && !state.authenticated) return;
 		if (!assetCas) return; // no asset plane configured
-		void handleAssetRequest(assetCas, body)
+		void handleAssetRequest(assetCas, body, {
+			account: state.account,
+			...(assetGc ? { gc: assetGc } : {}),
+		})
 			.then(({ kind, response, meteredBytes }) => {
 				sendAsset(connId, response);
 				if (meteredBytes > 0) {

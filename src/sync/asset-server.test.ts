@@ -1,9 +1,9 @@
 /**
- * Asset-B3 — the asset channel wired through `createRelayCore` (socket-free,
- * mirrors `durable.test.ts`). A client PUT/GET/HAS on channel `0x02` reaches
- * the CAS and replies point-to-point, ingress/egress is metered, and a node
- * with no asset plane (or, gated, an unauthenticated connection) drops the
- * frame.
+ * Asset-B3/B6 — the asset channel wired through `createRelayCore` (socket-free,
+ * mirrors `durable.test.ts`). A client PUT/GET/HAS/REFS on channel `0x02`
+ * reaches the CAS + GC and replies point-to-point, ingress/egress is metered,
+ * and a node with no asset plane (or, gated, an unauthenticated connection)
+ * drops the frame.
  */
 
 import { describe, expect, test } from "bun:test";
@@ -11,6 +11,8 @@ import { AssetWireKind, encodeAssetRequest } from "../asset-wire";
 import { MeterKind } from "../metering";
 import { type ServerWebSocketLike, createRelayCore } from "../server";
 import { MemoryAssetCas } from "./asset-cas";
+import { AssetGc } from "./asset-gc";
+import { MemoryRefLedger } from "./ref-ledger";
 
 const ASSET_BYTE = 0x02;
 const enc = new TextEncoder();
@@ -114,6 +116,46 @@ describe("asset channel through createRelayCore", () => {
 		core.handlers.onMessage(
 			ws,
 			channel(ASSET_BYTE, encodeAssetRequest({ kind: AssetWireKind.Has, hash: HASH })),
+		);
+		await flush();
+		expect(assetReplies(ws).length).toBe(0);
+	});
+
+	test("a Refs report on an open node lands in the ledger, keyed by the header account", async () => {
+		const cas = new MemoryAssetCas();
+		const ledger = new MemoryRefLedger();
+		const gc = new AssetGc({ cas, ledger, now: () => 1234 });
+		const core = createRelayCore({ assetCas: cas, assetGc: gc });
+		const ws = fakeWs();
+		core.handlers.onOpen(ws);
+		core.handlers.onMessage(
+			ws,
+			channel(
+				ASSET_BYTE,
+				encodeAssetRequest({
+					kind: AssetWireKind.Refs,
+					account: "acct",
+					device: "laptop",
+					hashes: [HASH],
+				}),
+			),
+		);
+		await flush();
+		expect(assetReplies(ws).at(-1)?.header).toEqual({ k: AssetWireKind.Refs, ok: true, count: 1 });
+		const state = await ledger.read("acct");
+		expect(state.devices.laptop).toEqual({ lastReportAt: 1234, refs: [HASH] });
+	});
+
+	test("a Refs report on a node with no GC plane is dropped (no reply)", async () => {
+		const core = createRelayCore({ assetCas: new MemoryAssetCas() }); // no assetGc
+		const ws = fakeWs();
+		core.handlers.onOpen(ws);
+		core.handlers.onMessage(
+			ws,
+			channel(
+				ASSET_BYTE,
+				encodeAssetRequest({ kind: AssetWireKind.Refs, account: "a", device: "d", hashes: [] }),
+			),
 		);
 		await flush();
 		expect(assetReplies(ws).length).toBe(0);

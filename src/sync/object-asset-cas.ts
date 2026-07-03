@@ -43,6 +43,11 @@ export class ObjectAssetCas implements AssetCas {
 		return this.#bucket.get(this.#key(hash));
 	}
 
+	async delete(hash: string): Promise<void> {
+		if (!isAssetHash(hash)) return; // never a hostile key
+		await this.#bucket.delete(this.#key(hash));
+	}
+
 	#key(hash: string): string {
 		return `${this.#prefix}assets/${hash}.bin`;
 	}

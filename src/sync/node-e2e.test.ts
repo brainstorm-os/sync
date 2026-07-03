@@ -70,6 +70,7 @@ function testConfig(port: number, storageDir: string): Config {
 		entitlement: null,
 		meteringLogPath: null,
 		limits: null,
+		assetGc: { graceMs: 1000, retentionMs: 10_000, sweepIntervalMs: null },
 		debug: false,
 	};
 }

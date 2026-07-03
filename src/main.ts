@@ -20,6 +20,11 @@
  *   AUTH_TIMEOUT_MS  SYNC-4b — gated auth deadline (default 10000).
  *   METERING_LOG_PATH SYNC-4b — NDJSON usage-metering sink (connect/ingress/egress).
  *   LIMITS_DISABLED  SYNC-5 — "1" turns OFF abuse caps / rate limits (default on).
+ *   ASSET_GC_GRACE_MS          Asset-B6 — mark → delete grace window (default 30d).
+ *   ASSET_GC_RETENTION_MS      Asset-B6 — device last-seen retention (default 90d).
+ *   ASSET_GC_SWEEP_INTERVAL_MS Asset-B6 — periodic sweep interval; unset/0 ⇒ no
+ *                              automatic sweep (ref tracking still on; an ops
+ *                              runner can invoke `AssetGc.sweep()` explicitly).
  *
  * Graceful shutdown: SIGTERM/SIGINT stop accepting new connections, close the
  * server, and exit.
@@ -34,12 +39,16 @@ import type { MeterEvent } from "./metering";
 import { type RelayCore, createRelayCore } from "./server";
 import type { AccountCatalog } from "./sync/account-catalog";
 import type { AssetCas } from "./sync/asset-cas";
+import { AssetGc, DEFAULT_GRACE_MS, DEFAULT_RETENTION_MS } from "./sync/asset-gc";
 import { BunS3Bucket, type S3BucketConfig } from "./sync/bun-s3-bucket";
 import { FileAccountCatalog } from "./sync/file-account-catalog";
 import { FileAssetCas } from "./sync/file-asset-cas";
+import { FileRefLedger } from "./sync/file-ref-ledger";
 import { FileSnapshotStore } from "./sync/file-snapshot-store";
 import { ObjectAssetCas } from "./sync/object-asset-cas";
+import { ObjectRefLedger } from "./sync/object-ref-ledger";
 import { ObjectAccountCatalog, ObjectSnapshotStore } from "./sync/object-store";
+import type { RefLedger } from "./sync/ref-ledger";
 import type { SnapshotStore } from "./sync/snapshot-store";
 
 type BunServer = { stop(closeActiveConnections?: boolean): void; readonly port: number };
@@ -68,6 +77,15 @@ export type StorageProvider =
 	| { kind: "local"; dir: string }
 	| { kind: "s3"; s3: S3BucketConfig };
 
+/** Asset-B6 — GC windows + sweep scheduling. Ref tracking is always on when a
+ *  durable asset plane exists; only the periodic sweep is opt-in. */
+export type AssetGcConfig = {
+	graceMs: number;
+	retentionMs: number;
+	/** Null ⇒ no automatic sweep (explicit `AssetGc.sweep()` only). */
+	sweepIntervalMs: number | null;
+};
+
 export type Config = {
 	port: number;
 	auditLogPath: string | null;
@@ -78,6 +96,8 @@ export type Config = {
 	meteringLogPath: string | null;
 	/** SYNC-5 — abuse caps / rate limits, or null to disable. */
 	limits: LimitsConfig | null;
+	/** Asset-B6 — GC windows + sweep interval. */
+	assetGc: AssetGcConfig;
 	debug: boolean;
 };
 
@@ -136,6 +156,27 @@ function readStorageProvider(env: Record<string, string | undefined>): StoragePr
 	return { kind: "none" };
 }
 
+function readMs(env: Record<string, string | undefined>, name: string): number | null {
+	const raw = env[name];
+	if (!raw || raw.length === 0) return null;
+	const ms = Number(raw);
+	if (!Number.isInteger(ms) || ms < 0) {
+		throw new Error(`${name}: expected a non-negative integer (ms)`);
+	}
+	return ms;
+}
+
+function readAssetGc(env: Record<string, string | undefined>): AssetGcConfig {
+	const graceMs = readMs(env, "ASSET_GC_GRACE_MS") ?? DEFAULT_GRACE_MS;
+	const retentionMs = readMs(env, "ASSET_GC_RETENTION_MS") ?? DEFAULT_RETENTION_MS;
+	// The windows are the safety gates — zero would mean "delete instantly" /
+	// "trust no device", so both must stay positive.
+	if (graceMs <= 0) throw new Error("ASSET_GC_GRACE_MS: must be positive");
+	if (retentionMs <= 0) throw new Error("ASSET_GC_RETENTION_MS: must be positive");
+	const interval = readMs(env, "ASSET_GC_SWEEP_INTERVAL_MS");
+	return { graceMs, retentionMs, sweepIntervalMs: interval && interval > 0 ? interval : null };
+}
+
 export function readConfig(env: Record<string, string | undefined>): Config {
 	const rawPort = env.PORT ?? "7780";
 	const port = Number(rawPort);
@@ -150,6 +191,7 @@ export function readConfig(env: Record<string, string | undefined>): Config {
 		meteringLogPath:
 			env.METERING_LOG_PATH && env.METERING_LOG_PATH.length > 0 ? env.METERING_LOG_PATH : null,
 		limits: env.LIMITS_DISABLED === "1" ? null : DEFAULT_LIMITS,
+		assetGc: readAssetGc(env),
 		debug: env.LOG_LEVEL === "debug",
 	};
 }
@@ -166,17 +208,21 @@ function log(level: "info" | "error", message: string): void {
 	else console.info(line);
 }
 
-/** Resolve the configured provider into a `{ store, catalog, assetCas }` triple
- *  (or null for forward-only). The `ObjectBucket` seam means s3/local differ
- *  only here; the blob-plane CAS (Asset-B3) rides the same backend choice. */
-function buildStorage(
-	provider: StorageProvider,
-): { store: SnapshotStore; catalog: AccountCatalog; assetCas: AssetCas } | null {
+/** Resolve the configured provider into the storage set (or null for
+ *  forward-only). The `ObjectBucket` seam means s3/local differ only here; the
+ *  blob-plane CAS (Asset-B3) + GC ref ledger (Asset-B6) ride the same choice. */
+function buildStorage(provider: StorageProvider): {
+	store: SnapshotStore;
+	catalog: AccountCatalog;
+	assetCas: AssetCas;
+	refLedger: RefLedger;
+} | null {
 	if (provider.kind === "local") {
 		return {
 			store: new FileSnapshotStore(provider.dir),
 			catalog: new FileAccountCatalog(join(provider.dir, "catalog")),
 			assetCas: new FileAssetCas(join(provider.dir, "assets")),
+			refLedger: new FileRefLedger(join(provider.dir, "asset-gc")),
 		};
 	}
 	if (provider.kind === "s3") {
@@ -186,12 +232,13 @@ function buildStorage(
 			store: new ObjectSnapshotStore(bucket, prefix),
 			catalog: new ObjectAccountCatalog(bucket, prefix),
 			assetCas: new ObjectAssetCas(bucket, prefix),
+			refLedger: new ObjectRefLedger(bucket, prefix),
 		};
 	}
 	return null;
 }
 
-async function buildCore(config: Config): Promise<RelayCore> {
+async function buildCore(config: Config): Promise<{ core: RelayCore; assetGc: AssetGc | null }> {
 	const storage = buildStorage(config.storage);
 	const admission = config.entitlement
 		? new Admission({
@@ -211,7 +258,17 @@ async function buildCore(config: Config): Promise<RelayCore> {
 				).catch((err) => log("error", `metering append failed: ${(err as Error).message}`));
 			}
 		: undefined;
-	return createRelayCore({
+	const assetGc = storage
+		? new AssetGc({
+				cas: storage.assetCas,
+				ledger: storage.refLedger,
+				graceMs: config.assetGc.graceMs,
+				retentionMs: config.assetGc.retentionMs,
+				...(meter ? { meter } : {}),
+				onLog: (message: string) => log("info", message),
+			})
+		: null;
+	const core = createRelayCore({
 		...(config.auditLogPath
 			? {
 					auditSink: (entry: string) => {
@@ -229,12 +286,14 @@ async function buildCore(config: Config): Promise<RelayCore> {
 					onStoreError: (err: Error) => log("error", `store: ${err.message}`),
 				}
 			: {}),
+		...(assetGc ? { assetGc } : {}),
 		...(admission && config.entitlement
 			? { admission, authTimeoutMs: config.entitlement.authTimeoutMs }
 			: {}),
 		...(limits ? { limits } : {}),
 		...(meter ? { meter } : {}),
 	});
+	return { core, assetGc };
 }
 
 type WsLike = {
@@ -249,13 +308,19 @@ type UpgradeServer = {
 };
 
 /**
- * Boot the node on `config.port` and return the live server + core. Async
+ * Boot the node on `config.port` and return the live server + core (+ the GC
+ * engine and its sweep timer, when a durable asset plane is configured). Async
  * because gated admission imports its Ed25519 verifier keyset (WebCrypto).
  * Exported so a real-WebSocket integration test can start a node, connect WS
  * clients, and `server.stop()`.
  */
-export async function startNode(config: Config): Promise<{ server: BunServer; core: RelayCore }> {
-	const core = await buildCore(config);
+export async function startNode(config: Config): Promise<{
+	server: BunServer;
+	core: RelayCore;
+	assetGc: AssetGc | null;
+	stopSweep: () => void;
+}> {
+	const { core, assetGc } = await buildCore(config);
 	const BunRT = (globalThis as { Bun?: BunRuntime }).Bun;
 	if (!BunRT) {
 		throw new Error("brainstorm-sync: must run under Bun (globalThis.Bun missing)");
@@ -293,12 +358,24 @@ export async function startNode(config: Config): Promise<{ server: BunServer; co
 			return new Response("brainstorm-sync relay node v1", { status: 200 });
 		},
 	});
-	return { server, core };
+	let sweepTimer: ReturnType<typeof setInterval> | null = null;
+	if (assetGc && config.assetGc.sweepIntervalMs) {
+		sweepTimer = setInterval(() => {
+			void assetGc
+				.sweep()
+				.catch((err) => log("error", `asset-gc sweep: ${(err as Error).message}`));
+		}, config.assetGc.sweepIntervalMs);
+	}
+	const stopSweep = (): void => {
+		if (sweepTimer !== null) clearInterval(sweepTimer);
+		sweepTimer = null;
+	};
+	return { server, core, assetGc, stopSweep };
 }
 
 async function main(): Promise<void> {
 	const config = readConfig(process.env);
-	const { server } = await startNode(config);
+	const { server, stopSweep } = await startNode(config);
 
 	log(
 		"info",
@@ -309,6 +386,7 @@ async function main(): Promise<void> {
 
 	const shutdown = (signal: string): void => {
 		log("info", `${signal} — draining + closing`);
+		stopSweep();
 		server.stop(true);
 		process.exit(0);
 	};
