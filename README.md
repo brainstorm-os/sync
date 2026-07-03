@@ -20,6 +20,7 @@ Clients connect over WebSocket and speak a small binary wire protocol:
 
 - `0x00` + JSON control — `{op:"subscribe"|"unsubscribe", entityIds:[…]}`, `{op:"catalog", account}` (cold-restore enumeration), and, on a gated node, the `{op:"auth", token, account, sig}` handshake.
 - `0x01` + `<frame>` — an opaque encrypted update; the node fans it out to the entity's other subscribers.
+- `0x02` + `<asset frame>` — the blob plane: content-addressed encrypted attachment chunks (`has`/`put`/`get` by ciphertext-hash) plus the `refs` report that feeds asset GC (below). Request/response, no fan-out.
 - `0x03` + `<bundle>` (server→client) — bundled backfill: many opaque frames length-prefixed into one message, sent only when a `subscribe` carries `bundle:true` (fresh-device bootstrap; old clients keep the per-frame stream).
 
 ## Storage
@@ -47,6 +48,15 @@ The node emits NDJSON **metering** events (connect / ingress / egress byte count
 
 On by default (`LIMITS_DISABLED=1` to turn off): per-IP connection rate, per-connection message + byte rate, per-account frame rate, and hard caps on message size and subscriptions-per-connection. Token buckets absorb bursts and shed sustained over-rate.
 
+## Asset GC
+
+The node can't read manifests (it's blind), so attachment-chunk reclamation runs on **client-reported ref-sets**: each device periodically posts the full set of chunk hashes its converged vault still references (`refs` on the asset channel — the hashes are the same opaque addresses the store already keys). Reclamation is conservative mark-and-sweep, double-gated:
+
+1. **Last-seen guard** — a chunk stays while ANY device that reported within the retention window (default 90 days) still references it; an account with no report inside the window is skipped entirely (dormant bytes are kept).
+2. **Grace window** — an unreferenced chunk is first *marked* (default 30 days, reversible: a re-reference or re-upload rescues it); only an expired mark is deleted.
+
+Ref tracking is always on when storage is configured; the periodic sweep is opt-in via `ASSET_GC_SWEEP_INTERVAL_MS` (unset = explicit `sweep()` only). Reclaimed bytes are metered (`reclaim` events) per account.
+
 ## Config
 
 | Env | Default | Meaning |
@@ -62,6 +72,9 @@ On by default (`LIMITS_DISABLED=1` to turn off): per-IP connection rate, per-con
 | `AUTH_TIMEOUT_MS` | `10000` | close a connection that never authenticates |
 | `METERING_LOG_PATH` | _(unset)_ | NDJSON usage-metering sink |
 | `LIMITS_DISABLED` | _(unset)_ | `1` turns off all rate limits |
+| `ASSET_GC_GRACE_MS` | `2592000000` (30 d) | mark → delete grace window |
+| `ASSET_GC_RETENTION_MS` | `7776000000` (90 d) | device last-seen retention window |
+| `ASSET_GC_SWEEP_INTERVAL_MS` | _(unset)_ | periodic sweep interval; unset/`0` ⇒ no automatic sweep |
 
 See [`.env.example`](./.env.example) for the annotated full set.
 

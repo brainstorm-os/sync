@@ -18,7 +18,7 @@
  * **Relay-blind.** Opaque bytes only; zero crypto imports. See CLAUDE.md.
  */
 
-import { access, mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import { access, mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { type AssetCas, isAssetHash } from "./asset-cas";
 
@@ -62,6 +62,11 @@ export class FileAssetCas implements AssetCas {
 		} catch {
 			return null;
 		}
+	}
+
+	delete(hash: string): Promise<void> {
+		if (!isAssetHash(hash)) return Promise.resolve(); // never traverses the root
+		return this.#serial(hash, () => rm(this.#pathFor(hash), { force: true }));
 	}
 
 	#shardDir(hash: string): string {

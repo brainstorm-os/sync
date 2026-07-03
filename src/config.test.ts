@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { readConfig } from "./main";
+import { DEFAULT_GRACE_MS, DEFAULT_RETENTION_MS } from "./sync/asset-gc";
 
 describe("readConfig", () => {
 	test("defaults", () => {
@@ -67,5 +68,33 @@ describe("readConfig", () => {
 			S3_SECRET_ACCESS_KEY: "s",
 		});
 		expect(c.storage.kind).toBe("s3");
+	});
+
+	test("asset GC defaults: 30d grace, 90d retention, no automatic sweep", () => {
+		expect(readConfig({}).assetGc).toEqual({
+			graceMs: DEFAULT_GRACE_MS,
+			retentionMs: DEFAULT_RETENTION_MS,
+			sweepIntervalMs: null,
+		});
+	});
+
+	test("ASSET_GC_* env overrides the windows and enables the sweep interval", () => {
+		const c = readConfig({
+			ASSET_GC_GRACE_MS: "60000",
+			ASSET_GC_RETENTION_MS: "120000",
+			ASSET_GC_SWEEP_INTERVAL_MS: "5000",
+		});
+		expect(c.assetGc).toEqual({ graceMs: 60_000, retentionMs: 120_000, sweepIntervalMs: 5000 });
+	});
+
+	test("ASSET_GC_SWEEP_INTERVAL_MS=0 means no automatic sweep", () => {
+		expect(readConfig({ ASSET_GC_SWEEP_INTERVAL_MS: "0" }).assetGc.sweepIntervalMs).toBeNull();
+	});
+
+	test("rejects non-positive / non-integer GC windows", () => {
+		expect(() => readConfig({ ASSET_GC_GRACE_MS: "0" })).toThrow(/positive/);
+		expect(() => readConfig({ ASSET_GC_RETENTION_MS: "0" })).toThrow(/positive/);
+		expect(() => readConfig({ ASSET_GC_GRACE_MS: "-5" })).toThrow();
+		expect(() => readConfig({ ASSET_GC_RETENTION_MS: "ninety days" })).toThrow();
 	});
 });

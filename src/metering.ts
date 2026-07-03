@@ -19,6 +19,10 @@ export enum MeterKind {
 	Ingress = "ingress",
 	/** Bytes the node served to a subscriber (backfill / fan-out downloads). */
 	Egress = "egress",
+	/** Asset-B6 — stored chunk bytes the GC sweep reclaimed for an account
+	 *  (billing sees hosted storage shrink; the byte count is ciphertext size,
+	 *  never content). */
+	Reclaim = "reclaim",
 }
 
 export type MeterEvent = {
