@@ -8,6 +8,8 @@
 	"scripts": {
 		"start": "bun run src/main.ts",
 		"dev": "bun --watch run src/main.ts",
+		"start:feedback": "bun run feedback-collector/src/main.ts",
+		"dev:feedback": "bun --watch run feedback-collector/src/main.ts",
 		"test": "bun test",
 		"typecheck": "tsc --noEmit",
 		"lint": "biome check .",
